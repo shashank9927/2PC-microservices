@@ -1,0 +1,124 @@
+services:
+  coordinator-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: coordinator
+      POSTGRES_PASSWORD: coordinator
+      POSTGRES_DB: coordinator
+    ports:
+      - "5432:5432"
+    volumes:
+      - coordinator-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coordinator -d coordinator"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  bank-a-db:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "max_prepared_transactions=100"]
+    environment:
+      POSTGRES_USER: bank_a
+      POSTGRES_PASSWORD: bank_a
+      POSTGRES_DB: bank_a
+    ports:
+      - "5433:5432"
+    volumes:
+      - bank-a-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bank_a -d bank_a"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  bank-b-db:
+    image: postgres:16-alpine
+    command: ["postgres", "-c", "max_prepared_transactions=100"]
+    environment:
+      POSTGRES_USER: bank_b
+      POSTGRES_PASSWORD: bank_b
+      POSTGRES_DB: bank_b
+    ports:
+      - "5434:5432"
+    volumes:
+      - bank-b-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bank_b -d bank_b"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  bank-a:
+    build: .
+    command: >
+      sh -c "npm run migrate:participant && node dist/packages/participant/src/index.js"
+    environment:
+      DATABASE_URL: postgresql://bank_a:bank_a@bank-a-db:5432/bank_a?schema=public
+      PORT: 3001
+      PARTICIPANT_NAME: bank-a
+      PARTICIPANT_ACCOUNT_ID: alice
+      PARTICIPANT_INITIAL_BALANCE_CENTS: 100000
+    depends_on:
+      bank-a-db:
+        condition: service_healthy
+    ports:
+      - "3001:3001"
+    restart: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3001/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  bank-b:
+    build: .
+    command: >
+      sh -c "npm run migrate:participant && node dist/packages/participant/src/index.js"
+    environment:
+      DATABASE_URL: postgresql://bank_b:bank_b@bank-b-db:5432/bank_b?schema=public
+      PORT: 3002
+      PARTICIPANT_NAME: bank-b
+      PARTICIPANT_ACCOUNT_ID: bob
+      PARTICIPANT_INITIAL_BALANCE_CENTS: 50000
+    depends_on:
+      bank-b-db:
+        condition: service_healthy
+    ports:
+      - "3002:3002"
+    restart: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:3002/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  coordinator:
+    build: .
+    command: >
+      sh -c "npm run migrate:coordinator && node dist/packages/coordinator/src/index.js"
+    environment:
+      DATABASE_URL: postgresql://coordinator:coordinator@coordinator-db:5432/coordinator?schema=public
+      PORT: 3000
+      BANK_A_URL: http://bank-a:3001
+      BANK_B_URL: http://bank-b:3002
+      BANK_A_ACCOUNT_ID: alice
+      BANK_B_ACCOUNT_ID: bob
+      PARTICIPANT_TIMEOUT_MS: 4000
+    depends_on:
+      coordinator-db:
+        condition: service_healthy
+      bank-a:
+        condition: service_healthy
+      bank-b:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    restart: on-failure
+
+volumes:
+  coordinator-db-data:
+  bank-a-db-data:
+  bank-b-db-data:

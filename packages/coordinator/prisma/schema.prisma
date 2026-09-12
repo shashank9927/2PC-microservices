@@ -1,0 +1,38 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Decision {
+  COMMIT
+  ABORT
+}
+
+enum CoordinatorStatus {
+  PREPARING
+  DECIDED
+  COMPLETING
+  COMPLETED
+}
+
+model DistributedTransaction {
+  id             String            @id
+  participants   Json
+  fromAccountId  String
+  toAccountId    String
+  amountCents    Int
+  decision       Decision?
+  status         CoordinatorStatus @default(PREPARING)
+  prepareError   String?
+  resolutionNote String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  @@index([status])
+  @@index([decision])
+}
