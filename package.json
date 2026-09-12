@@ -1,0 +1,32 @@
+{
+  "name": "postgres-2pc-microservices-demo",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copyGeneratedClients.cjs",
+    "dev:coordinator": "tsx packages/coordinator/src/index.ts",
+    "dev:bank-a": "tsx packages/participant/src/index.ts",
+    "prisma:generate": "prisma generate --schema packages/coordinator/prisma/schema.prisma && prisma generate --schema packages/participant/prisma/schema.prisma",
+    "migrate:coordinator": "prisma migrate deploy --schema packages/coordinator/prisma/schema.prisma",
+    "migrate:participant": "prisma migrate deploy --schema packages/participant/prisma/schema.prisma",
+    "test": "tsx scripts/testSuite.ts",
+    "check": "npm run prisma:generate && npm run build"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.19.0",
+    "express": "^5.2.1",
+    "pg": "^8.16.3",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.18.12",
+    "@types/pg": "^8.15.6",
+    "prisma": "^6.19.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
