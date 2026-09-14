@@ -45,6 +45,8 @@ async function runTests() {
     bankAAccountId: "alice",
     bankBAccountId: "bob",
     participantTimeoutMs: 3000,
+    reaperIntervalMs: 60000,
+    stuckTransactionTimeoutMs: 60000,
   };
 
   // Reset database tables
@@ -442,6 +444,160 @@ async function runTests() {
       name: "Audit Log Integrity (Phase Overwrite on Rollback)",
       passed: !phaseOverwritten, // It should NOT overwrite prepare_failed with rolled_back
       details: `Bank B final recorded phase in participants array: '${bankBParticipant?.phase}' (Was prepare_failed, became ${bankBParticipant?.phase})`,
+    });
+
+    // TEST 15: Idempotency Key Replay (Exact Duplicate)
+    console.log("\n--- TEST 15: Idempotency Key Replay (Exact Duplicate) ---");
+    const bal15BeforeA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal15BeforeB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    const idemKey1 = "idempotency-key-test-001";
+    const firstIdemRes = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": idemKey1 },
+      body: JSON.stringify({ amountCents: 1500 }),
+    });
+
+    const bal15MidA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal15MidB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    // Send the exact duplicate request with same idempotency key
+    const secondIdemRes = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": idemKey1 },
+      body: JSON.stringify({ amountCents: 1500 }),
+    });
+
+    const bal15AfterA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal15AfterB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    const t15Passed =
+      firstIdemRes.status === 201 &&
+      secondIdemRes.status === 201 &&
+      secondIdemRes.body.transactionId === firstIdemRes.body.transactionId &&
+      secondIdemRes.body.decision === "COMMIT" &&
+      bal15MidA === bal15BeforeA - 1500 &&
+      bal15MidB === bal15BeforeB + 1500 &&
+      bal15AfterA === bal15MidA &&
+      bal15AfterB === bal15MidB;
+
+    results.push({
+      name: "Idempotency Key Exact Replay (Duplicate Transfer Prevention)",
+      passed: t15Passed,
+      details: `First TxId: ${firstIdemRes.body.transactionId}, Second TxId: ${secondIdemRes.body.transactionId}, Second status: ${secondIdemRes.status}, Alice delta: ${bal15AfterA - bal15BeforeA}`,
+    });
+
+    // TEST 16: Idempotency Key Parameter Mismatch
+    console.log("\n--- TEST 16: Idempotency Key Parameter Mismatch Conflict ---");
+    const mismatchRes = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": idemKey1 },
+      body: JSON.stringify({ amountCents: 9999 }),
+    });
+
+    const bal16AfterA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const t16Passed = mismatchRes.status === 422 && bal16AfterA === bal15AfterA;
+
+    results.push({
+      name: "Idempotency Key Parameter Mismatch Rejection",
+      passed: t16Passed,
+      details: `Status: ${mismatchRes.status} (Expected 422), Error: ${mismatchRes.body.error}`,
+    });
+
+    // TEST 17: Idempotency Key on Aborted Transfer Replay
+    console.log("\n--- TEST 17: Idempotency Key on Aborted Transfer Replay ---");
+    const idemAbortKey = "idempotency-abort-test-001";
+    const abortFirst = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": idemAbortKey },
+      body: JSON.stringify({ amountCents: 100, forcePrepareFailureAt: "bank-b" }),
+    });
+
+    const abortSecond = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": idemAbortKey },
+      body: JSON.stringify({ amountCents: 100, forcePrepareFailureAt: "bank-b" }),
+    });
+
+    const t17Passed =
+      abortFirst.status === 422 &&
+      abortSecond.status === 422 &&
+      abortSecond.body.transactionId === abortFirst.body.transactionId &&
+      abortSecond.body.decision === "ABORT";
+
+    results.push({
+      name: "Idempotency Key on Aborted Transfer Replay",
+      passed: t17Passed,
+      details: `First status: ${abortFirst.status}, Second status: ${abortSecond.status}, Decision: ${abortSecond.body.decision}`,
+    });
+
+    // TEST 18: Automated Stuck-Transaction Reaper
+    console.log("\n--- TEST 18: Automated Stuck-Transaction Reaper ---");
+    const stuckTxId = "stuck-reaper-tx-001";
+
+    // 1. Participant Bank A prepares and holds a lock on Alice
+    await api("http://127.0.0.1:3011/prepare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        transactionId: stuckTxId,
+        participantName: "bank-a",
+        operation: { kind: "debit", accountId: "alice", amountCents: 500 },
+      }),
+    });
+
+    // 2. Coordinator records transaction in PREPARING (simulating crash before decision was logged)
+    const twoMinutesAgo = new Date(Date.now() - 120_000);
+    await coordPrisma.distributedTransaction.create({
+      data: {
+        id: stuckTxId,
+        participants: [
+          { name: "bank-a", url: "http://127.0.0.1:3011", accountId: "alice", phase: "prepared" },
+          { name: "bank-b", url: "http://127.0.0.1:3012", accountId: "bob", phase: "skipped" },
+        ],
+        fromAccountId: "alice",
+        toAccountId: "bob",
+        amountCents: 500,
+        decision: null,
+        status: "PREPARING",
+        createdAt: twoMinutesAgo,
+      },
+    });
+
+    const prepListBefore = await api("http://127.0.0.1:3011/prepared");
+    const bankAHadLock = prepListBefore.body.prepared?.some((p: any) => p.gid === stuckTxId);
+
+    // 3. Trigger reaper sweep via POST /reaper/run
+    const reaperRes = await api("http://127.0.0.1:3010/reaper/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ olderThanMs: 30000 }),
+    });
+
+    // 4. Verify the stuck transaction was aborted and Bank A released the lock
+    const dbTxAfterReap = await coordPrisma.distributedTransaction.findUnique({ where: { id: stuckTxId } });
+    const prepListAfter = await api("http://127.0.0.1:3011/prepared");
+    const bankAFreedLock = !prepListAfter.body.prepared?.some((p: any) => p.gid === stuckTxId);
+
+    // Verify subsequent transfer on Alice succeeds immediately without blocking
+    const afterReapTransfer = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ amountCents: 100 }),
+    });
+
+    const t18Passed =
+      bankAHadLock &&
+      bankAFreedLock &&
+      reaperRes.body.reapedCount >= 1 &&
+      dbTxAfterReap?.status === "COMPLETED" &&
+      dbTxAfterReap?.decision === "ABORT" &&
+      afterReapTransfer.status === 201;
+
+    results.push({
+      name: "Automated Stuck-Transaction Reaper & Row-Lock Release",
+      passed: t18Passed,
+      details: `Had lock before: ${bankAHadLock}, Freed lock after: ${bankAFreedLock}, Reaped count: ${reaperRes.body.reapedCount}, DB Status: ${dbTxAfterReap?.status}, Post-reap transfer: ${afterReapTransfer.status}`,
     });
 
   } finally {
