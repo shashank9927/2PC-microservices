@@ -22,6 +22,7 @@ enum CoordinatorStatus {
 
 model DistributedTransaction {
   id             String            @id
+  idempotencyKey String?           @unique
   participants   Json
   fromAccountId  String
   toAccountId    String
@@ -35,4 +36,5 @@ model DistributedTransaction {
 
   @@index([status])
   @@index([decision])
+  @@index([createdAt])
 }
