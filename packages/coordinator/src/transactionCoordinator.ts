@@ -9,10 +9,25 @@ import {
   type ParticipantProgress,
 } from "./participantClient";
 
+export class IdempotencyMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IdempotencyMismatchError";
+  }
+}
+
+export class IdempotencyConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IdempotencyConflictError";
+  }
+}
+
 export type TransferRequest = {
   fromAccountId: string;
   toAccountId: string;
   amountCents: number;
+  idempotencyKey?: string;
   forcePrepareFailureAt?: ParticipantName;
   simulateCrashAfterDecision?: boolean;
 };
@@ -65,18 +80,84 @@ export class TransactionCoordinator {
     private readonly config: CoordinatorConfig,
   ) {}
 
+  private async handleExistingIdempotentTransfer(
+    existing: {
+      id: string;
+      fromAccountId: string;
+      toAccountId: string;
+      amountCents: number;
+      status: string;
+      decision: Decision | null;
+      resolutionNote: string | null;
+    },
+    input: TransferRequest,
+  ): Promise<Resolution> {
+    if (
+      existing.fromAccountId !== input.fromAccountId ||
+      existing.toAccountId !== input.toAccountId ||
+      existing.amountCents !== input.amountCents
+    ) {
+      throw new IdempotencyMismatchError(
+        "Idempotency key was previously used with different transfer parameters",
+      );
+    }
+
+    if (existing.status === "COMPLETED" && existing.decision) {
+      return {
+        transactionId: existing.id,
+        decision: existing.decision,
+        complete: true,
+        errors: existing.resolutionNote ? [existing.resolutionNote] : [],
+      };
+    }
+
+    if (existing.decision) {
+      return this.resolve(existing.id);
+    }
+
+    throw new IdempotencyConflictError(
+      "A transaction with this idempotency key is currently in progress",
+    );
+  }
+
   async startTransfer(input: TransferRequest): Promise<Resolution> {
+    if (input.idempotencyKey) {
+      const existing = await this.prisma.distributedTransaction.findUnique({
+        where: { idempotencyKey: input.idempotencyKey },
+      });
+      if (existing) {
+        return this.handleExistingIdempotentTransfer(existing, input);
+      }
+    }
+
     const transactionId = randomUUID();
     const participants = configuredParticipants(this.config);
-    await this.prisma.distributedTransaction.create({
-      data: {
-        id: transactionId,
-        participants: asJson(participants),
-        fromAccountId: input.fromAccountId,
-        toAccountId: input.toAccountId,
-        amountCents: input.amountCents,
-      },
-    });
+    try {
+      await this.prisma.distributedTransaction.create({
+        data: {
+          id: transactionId,
+          idempotencyKey: input.idempotencyKey,
+          participants: asJson(participants),
+          fromAccountId: input.fromAccountId,
+          toAccountId: input.toAccountId,
+          amountCents: input.amountCents,
+        },
+      });
+    } catch (error) {
+      if (
+        input.idempotencyKey &&
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        error.code === "P2002"
+      ) {
+        const existing = await this.prisma.distributedTransaction.findUnique({
+          where: { idempotencyKey: input.idempotencyKey },
+        });
+        if (existing) {
+          return this.handleExistingIdempotentTransfer(existing, input);
+        }
+      }
+      throw error;
+    }
 
     let prepareError: string | undefined;
     for (let index = 0; index < participants.length; index += 1) {
@@ -217,6 +298,35 @@ export class TransactionCoordinator {
     const results: Resolution[] = [];
     for (const transaction of transactions) {
       results.push(await this.resolve(transaction.id));
+    }
+    return results;
+  }
+
+  async reapStuckTransactions(olderThanMs: number = 60_000): Promise<Resolution[]> {
+    const cutoff = new Date(Date.now() - Math.max(0, olderThanMs));
+    const stuck = await this.prisma.distributedTransaction.findMany({
+      where: {
+        status: "PREPARING",
+        decision: null,
+        createdAt: { lte: cutoff },
+      },
+      orderBy: { createdAt: "asc" },
+    });
+
+    const results: Resolution[] = [];
+    for (const tx of stuck) {
+      console.warn(
+        `[coordinator] reaper aborting stuck transaction ${tx.id} (created at ${tx.createdAt.toISOString()})`,
+      );
+      await this.prisma.distributedTransaction.update({
+        where: { id: tx.id },
+        data: {
+          decision: Decision.ABORT,
+          status: "DECIDED",
+          resolutionNote: "Automated reaper aborted stuck undecided transaction",
+        },
+      });
+      results.push(await this.resolve(tx.id));
     }
     return results;
   }

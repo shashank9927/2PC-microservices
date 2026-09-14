@@ -6,6 +6,8 @@ export interface CoordinatorConfig {
   bankAAccountId: string;
   bankBAccountId: string;
   participantTimeoutMs: number;
+  reaperIntervalMs: number;
+  stuckTransactionTimeoutMs: number;
 }
 
 function required(name: string): string {
@@ -29,5 +31,7 @@ export function loadConfig(): CoordinatorConfig {
     bankAAccountId: required("BANK_A_ACCOUNT_ID"),
     bankBAccountId: required("BANK_B_ACCOUNT_ID"),
     participantTimeoutMs: positiveInteger("PARTICIPANT_TIMEOUT_MS", 4000),
+    reaperIntervalMs: positiveInteger("REAPER_INTERVAL_MS", 60_000),
+    stuckTransactionTimeoutMs: positiveInteger("STUCK_TRANSACTION_TIMEOUT_MS", 60_000),
   };
 }

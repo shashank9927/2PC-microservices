@@ -23,8 +23,21 @@ async function main() {
   const recoveryTimer = setInterval(() => void recover(), 10_000);
   recoveryTimer.unref();
 
+  const reap = async () => {
+    try {
+      const results = await coordinator.reapStuckTransactions(config.stuckTransactionTimeoutMs);
+      if (results.length > 0) console.log("[coordinator] reaper reaped stuck transactions", results);
+    } catch (error) {
+      console.error("[coordinator] reaper sweep failed", error);
+    }
+  };
+  await reap();
+  const reaperTimer = setInterval(() => void reap(), config.reaperIntervalMs);
+  reaperTimer.unref();
+
   const shutdown = () => {
     clearInterval(recoveryTimer);
+    clearInterval(reaperTimer);
     server.close(() => void prisma.$disconnect().finally(() => process.exit(0)));
   };
   process.once("SIGTERM", shutdown);
