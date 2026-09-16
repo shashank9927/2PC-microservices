@@ -1,5 +1,6 @@
 import { createParticipantApp } from "../packages/participant/src/app";
 import { createCoordinatorApp } from "../packages/coordinator/src/app";
+import { createRatesApp } from "../packages/rates/src/app";
 import { PrismaClient as CoordinatorPrismaClient } from "../packages/coordinator/src/generated/client";
 import { PrismaClient as ParticipantPrismaClient } from "../packages/participant/src/generated/client";
 import type { Server } from "node:http";
@@ -27,6 +28,7 @@ async function runTests() {
     port: 3011,
     initialAccountId: "alice",
     initialBalanceCents: 100000,
+    currency: "USD",
   };
 
   const bankBConfig = {
@@ -35,6 +37,7 @@ async function runTests() {
     port: 3012,
     initialAccountId: "bob",
     initialBalanceCents: 50000,
+    currency: "EUR",
   };
 
   const coordinatorConfig = {
@@ -68,6 +71,9 @@ async function runTests() {
 
   const bankBInstance = await createParticipantApp(bankBConfig);
   const serverBankB: Server = bankBInstance.app.listen(bankBConfig.port);
+
+  const ratesAppInstance = createRatesApp();
+  const serverRates: Server = ratesAppInstance.app.listen(3013);
 
   const coordInstance = createCoordinatorApp(coordPrisma, coordinatorConfig);
   const serverCoord: Server = coordInstance.app.listen(coordinatorConfig.port);
@@ -600,11 +606,163 @@ async function runTests() {
       details: `Had lock before: ${bankAHadLock}, Freed lock after: ${bankAFreedLock}, Reaped count: ${reaperRes.body.reapedCount}, DB Status: ${dbTxAfterReap?.status}, Post-reap transfer: ${afterReapTransfer.status}`,
     });
 
+    // TEST 19: Dynamic Participant Registration API
+    console.log("\n--- TEST 19: Dynamic Participant Registration API ---");
+    const regRes = await api("http://127.0.0.1:3010/participants/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: "rates-service",
+        url: "http://127.0.0.1:3013",
+        type: "exchange-rate",
+      }),
+    });
+
+    const listRes = await api("http://127.0.0.1:3010/participants");
+    const isRatesRegistered = listRes.body.participants?.some((p: any) => p.name === "rates-service");
+
+    results.push({
+      name: "Dynamic Participant Registration (Rates Service)",
+      passed: regRes.status === 201 && isRatesRegistered,
+      details: `Registered status: ${regRes.status}, In registry: ${isRatesRegistered}`,
+    });
+
+    // TEST 20: Multi-Currency 2PC Commit (USD -> EUR with Rates Service)
+    console.log("\n--- TEST 20: Multi-Currency 2PC Commit (USD -> EUR with Rates Service) ---");
+    const bal20BeforeA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal20BeforeB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    // Transfer 1000 USD cents from Alice (Bank A, USD) to Bob (Bank B, EUR)
+    // Rate is 0.85 -> 1000 * 0.85 = 850 EUR cents
+    const transfer20Res = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fromAccountId: "alice", toAccountId: "bob", amountCents: 1000 }),
+    });
+
+    const bal20AfterA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal20AfterB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    // Check transaction participant list in coordinator log
+    const tx20 = (await api("http://127.0.0.1:3010/transactions")).body.find((t: any) => t.id === transfer20Res.body.transactionId);
+    const hasAllThreeCommitted =
+      tx20?.participants?.length === 3 &&
+      tx20?.participants?.every((p: any) => p.phase === "committed") &&
+      tx20?.participants?.some((p: any) => p.name === "rates-service");
+
+    const t20Passed =
+      transfer20Res.status === 201 &&
+      transfer20Res.body.decision === "COMMIT" &&
+      transfer20Res.body.complete === true &&
+      bal20AfterA === bal20BeforeA - 1000 &&
+      bal20AfterB === bal20BeforeB + 850 &&
+      hasAllThreeCommitted;
+
+    results.push({
+      name: "Multi-Currency 3-Participant 2PC Commit (USD -> EUR)",
+      passed: t20Passed,
+      details: `Alice (USD) -${bal20BeforeA - bal20AfterA}, Bob (EUR) +${bal20AfterB - bal20BeforeB}, All 3 committed: ${hasAllThreeCommitted}`,
+    });
+
+    // TEST 21: Multi-Currency Forced Abort at Rates Service
+    console.log("\n--- TEST 21: Multi-Currency Forced Abort at Rates Service ---");
+    const bal21BeforeA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal21BeforeB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    const transfer21Res = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fromAccountId: "alice",
+        toAccountId: "bob",
+        amountCents: 1000,
+        forcePrepareFailureAt: "rates-service",
+      }),
+    });
+
+    const bal21AfterA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal21AfterB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    const t21Passed =
+      transfer21Res.status === 422 &&
+      transfer21Res.body.decision === "ABORT" &&
+      bal21AfterA === bal21BeforeA &&
+      bal21AfterB === bal21BeforeB;
+
+    results.push({
+      name: "Multi-Currency Forced Abort at Rates Service (Rollback at Bank A)",
+      passed: t21Passed,
+      details: `Status: ${transfer21Res.status}, Decision: ${transfer21Res.body.decision}, Balances unchanged: ${bal21AfterA === bal21BeforeA && bal21AfterB === bal21BeforeB}`,
+    });
+
+    // TEST 22: Multi-Currency Forced Abort at Destination Bank (Bank B)
+    console.log("\n--- TEST 22: Multi-Currency Forced Abort at Bank B ---");
+    const bal22BeforeA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal22BeforeB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    const transfer22Res = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fromAccountId: "alice",
+        toAccountId: "bob",
+        amountCents: 1000,
+        forcePrepareFailureAt: "bank-b",
+      }),
+    });
+
+    const bal22AfterA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal22AfterB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    const ratesPreparedAfter22 = (await api("http://127.0.0.1:3013/prepared")).body.prepared;
+    const noStrayRateLock = !ratesPreparedAfter22?.some((p: any) => p.gid === transfer22Res.body.transactionId);
+
+    const t22Passed =
+      transfer22Res.status === 422 &&
+      transfer22Res.body.decision === "ABORT" &&
+      bal22AfterA === bal22BeforeA &&
+      bal22AfterB === bal22BeforeB &&
+      noStrayRateLock;
+
+    results.push({
+      name: "Multi-Currency Forced Abort at Bank B (Rollback at Bank A & Rates Service)",
+      passed: t22Passed,
+      details: `Decision: ${transfer22Res.body.decision}, Balances unchanged: ${bal22AfterA === bal22BeforeA}, No stray rate lock: ${noStrayRateLock}`,
+    });
+
+    // TEST 23: Reverse Multi-Currency 2PC Commit (EUR -> USD)
+    console.log("\n--- TEST 23: Reverse Multi-Currency 2PC Commit (EUR -> USD) ---");
+    const bal23BeforeA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal23BeforeB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    // Bob sends 1000 EUR cents to Alice. Rate EUR:USD = 1.18 -> Alice gets 1180 USD cents
+    const transfer23Res = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fromAccountId: "bob", toAccountId: "alice", amountCents: 1000 }),
+    });
+
+    const bal23AfterA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal23AfterB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    const t23Passed =
+      transfer23Res.status === 201 &&
+      transfer23Res.body.decision === "COMMIT" &&
+      bal23AfterB === bal23BeforeB - 1000 &&
+      bal23AfterA === bal23BeforeA + 1180;
+
+    results.push({
+      name: "Reverse Multi-Currency 3-Participant 2PC Commit (EUR -> USD)",
+      passed: t23Passed,
+      details: `Bob (EUR) -${bal23BeforeB - bal23AfterB}, Alice (USD) +${bal23AfterA - bal23BeforeA}, Decision: ${transfer23Res.body.decision}`,
+    });
+
   } finally {
     // Cleanup servers
     serverCoord.close();
     serverBankA.close();
     serverBankB.close();
+    serverRates.close();
     await bankAInstance.close();
     await bankBInstance.close();
     await coordPrisma.$disconnect();

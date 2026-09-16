@@ -131,24 +131,30 @@ This endpoint is intentionally unauthenticated because it is a local protocol de
 
 | Service | Endpoint | Purpose |
 | --- | --- | --- |
-| Coordinator | `POST /transfers` | Run a debit at Bank A and matching credit at Bank B. Supports `Idempotency-Key` header. |
+| Coordinator | `POST /transfers` | Run a debit at Bank A and matching credit at Bank B. Supports `Idempotency-Key` header and multi-currency conversion. |
 | Coordinator | `GET /transactions` | View the decision log. |
 | Coordinator | `POST /transactions/:id/resolve` | Re-send a previously logged phase-2 decision. |
 | Coordinator | `POST /transactions/:id/abort` | Operator abort for a transaction that crashed before a decision. |
 | Coordinator | `POST /recovery/run` | Trigger decision-log replay manually. |
 | Coordinator | `POST /reaper/run` | Trigger stuck-transaction reaper sweep manually. |
+| Coordinator | `POST /participants/register` | Dynamically register a microservice (bank, exchange rate service, etc.). |
+| Coordinator | `GET /participants` | List registered microservices in the dynamic registry. |
+| Coordinator | `DELETE /participants/:name` | Remove a microservice from the registry. |
 | Participant | `POST /prepare` | Start, lock, update, and prepare the local transaction. |
 | Participant | `POST /commit`, `POST /rollback` | Resolve a prepared transaction. |
 | Participant | `GET /accounts`, `GET /prepared` | Inspect local committed state and prepared transactions. |
+| Rate Service | `GET /rates`, `POST /rates` | Inspect or update exchange rates (e.g. USD:EUR, EUR:USD). |
+| Rate Service | `POST /prepare`, `/commit`, `/rollback` | 2PC participant endpoints to lock and settle exchange rate quotes. |
 
 ## Failure semantics and operational limits
 
 1. **Before a decision:** A coordinator crash can leave a transaction in `PREPARING`. An automated background reaper sweeps every 60s (configurable) and automatically aborts transactions stuck in `PREPARING`, rolling back prepared participants to release database locks. An operator can also manually trigger abort via `/transactions/:id/abort` or `/reaper/run`.
 2. **After a decision:** Recovery is deterministic. The coordinator only replays its persisted `COMMIT` or `ABORT`, at startup and every 10 seconds until all participant calls acknowledge.
 3. **Idempotency keys:** Clients can pass an `Idempotency-Key` HTTP header to `POST /transfers`. Duplicate requests return the original transaction response and prevent double debits/credits. Mismatched request parameters for an existing key return `422 Unprocessable Entity`.
-4. **Participant response timeout:** A timeout in phase 1 causes a durable `ABORT`. A timeout in phase 2 leaves the decision log in `DECIDED`, and recovery retries it. Network uncertainty means a participant can have prepared even when its response was lost, which is why abort is sent to every participant.
-5. **Idempotent resolution:** A participant treats a missing GID as `not_found`, so repeated phase-2 delivery is safe for this demo. Production systems normally add reconciliation/audit records and alerting for a missing expected GID, because absence alone cannot prove whether a human or prior resolver committed or rolled it back.
-6. **2PC cost:** Prepared transactions hold locks and consume PostgreSQL resources. They should be monitored (`pg_prepared_xacts`), time-bounded operationally, and kept very short. A Saga trades global atomicity for local commits plus compensating actions, usually giving higher availability for long-running workflows.
+4. **Multi-currency 3-participant 2PC:** Cross-currency transfers (USD -> EUR) coordinate three 2PC participants in atomic lock-step: Bank A debits USD, Rates Service locks the exchange rate quote, and Bank B credits the converted EUR. If any participant fails, all prepared participants are rolled back.
+5. **Participant response timeout:** A timeout in phase 1 causes a durable `ABORT`. A timeout in phase 2 leaves the decision log in `DECIDED`, and recovery retries it. Network uncertainty means a participant can have prepared even when its response was lost, which is why abort is sent to every participant.
+6. **Idempotent resolution:** A participant treats a missing GID as `not_found`, so repeated phase-2 delivery is safe for this demo. Production systems normally add reconciliation/audit records and alerting for a missing expected GID, because absence alone cannot prove whether a human or prior resolver committed or rolled it back.
+7. **2PC cost:** Prepared transactions hold locks and consume PostgreSQL resources. They should be monitored (`pg_prepared_xacts`), time-bounded operationally, and kept very short. A Saga trades global atomicity for local commits plus compensating actions, usually giving higher availability for long-running workflows.
 
 ## Resetting the demo
 
