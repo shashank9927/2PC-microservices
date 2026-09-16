@@ -35,14 +35,16 @@ export async function createParticipantApp(config: ParticipantConfig) {
   const app = express();
   app.use(express.json());
 
+  const currency = config.currency ?? (config.name === "bank-b" ? "EUR" : "USD");
+
   app.get("/health", async (_request, response) => {
     await pool.query("SELECT 1");
-    response.json({ name: config.name, ok: true });
+    response.json({ name: config.name, currency, ok: true });
   });
 
   app.get("/accounts", async (_request, response) => {
     const accounts = await prisma.account.findMany({ orderBy: { id: "asc" } });
-    response.json({ participant: config.name, accounts });
+    response.json({ participant: config.name, currency, accounts });
   });
 
   app.get("/prepared", async (_request, response) => {

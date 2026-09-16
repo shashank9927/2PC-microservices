@@ -6,8 +6,10 @@ import {
   prepareParticipant,
   resolveParticipant,
   type ParticipantName,
+  type ParticipantOperation,
   type ParticipantProgress,
 } from "./participantClient";
+import { ParticipantRegistry } from "./participantRegistry";
 
 export class IdempotencyMismatchError extends Error {
   constructor(message: string) {
@@ -57,9 +59,9 @@ function parseParticipants(value: Prisma.JsonValue): ParticipantProgress[] {
     }
     const participant = item as Record<string, unknown>;
     if (
-      (participant.name !== "bank-a" && participant.name !== "bank-b") ||
+      typeof participant.name !== "string" ||
+      !participant.name ||
       typeof participant.url !== "string" ||
-      typeof participant.accountId !== "string" ||
       typeof participant.phase !== "string"
     ) {
       throw new Error("Decision-log participant has invalid fields");
@@ -67,18 +69,42 @@ function parseParticipants(value: Prisma.JsonValue): ParticipantProgress[] {
     return {
       name: participant.name,
       url: participant.url,
-      accountId: participant.accountId,
+      ...(typeof participant.accountId === "string" ? { accountId: participant.accountId } : {}),
       phase: participant.phase as ParticipantProgress["phase"],
       ...(typeof participant.lastError === "string" ? { lastError: participant.lastError } : {}),
+      ...(participant.metadata && typeof participant.metadata === "object"
+        ? { metadata: participant.metadata as Record<string, unknown> }
+        : {}),
     };
   });
 }
 
 export class TransactionCoordinator {
+  public readonly registry: ParticipantRegistry;
+
   constructor(
     private readonly prisma: PrismaClient,
     private readonly config: CoordinatorConfig,
-  ) {}
+    registry?: ParticipantRegistry,
+  ) {
+    this.registry = registry ?? new ParticipantRegistry();
+    if (this.registry.list().length === 0) {
+      this.registry.register({
+        name: "bank-a",
+        url: this.config.bankAUrl,
+        type: "bank",
+        currency: "USD",
+        accountIds: [this.config.bankAAccountId],
+      });
+      this.registry.register({
+        name: "bank-b",
+        url: this.config.bankBUrl,
+        type: "bank",
+        currency: "EUR",
+        accountIds: [this.config.bankBAccountId],
+      });
+    }
+  }
 
   private async handleExistingIdempotentTransfer(
     existing: {
@@ -131,7 +157,35 @@ export class TransactionCoordinator {
     }
 
     const transactionId = randomUUID();
-    const participants = configuredParticipants(this.config);
+
+    const fromBank = this.registry.findBankForAccount(input.fromAccountId) ?? {
+      name: "bank-a",
+      url: this.config.bankAUrl,
+      type: "bank" as const,
+      currency: "USD",
+      accountIds: [input.fromAccountId],
+    };
+    const toBank = this.registry.findBankForAccount(input.toAccountId) ?? {
+      name: "bank-b",
+      url: this.config.bankBUrl,
+      type: "bank" as const,
+      currency: "EUR",
+      accountIds: [input.toAccountId],
+    };
+
+    const fromCurrency = fromBank.currency ?? "USD";
+    const toCurrency = toBank.currency ?? "EUR";
+    const isCrossCurrency = fromCurrency !== toCurrency;
+    const ratesService = isCrossCurrency ? this.registry.getRatesService() : undefined;
+
+    const participants: ParticipantProgress[] = [
+      { name: fromBank.name, url: fromBank.url, accountId: input.fromAccountId, phase: "pending" },
+    ];
+    if (ratesService) {
+      participants.push({ name: ratesService.name, url: ratesService.url, phase: "pending" });
+    }
+    participants.push({ name: toBank.name, url: toBank.url, accountId: input.toAccountId, phase: "pending" });
+
     try {
       await this.prisma.distributedTransaction.create({
         data: {
@@ -160,23 +214,53 @@ export class TransactionCoordinator {
     }
 
     let prepareError: string | undefined;
+    let targetCreditAmountCents = input.amountCents;
+
     for (let index = 0; index < participants.length; index += 1) {
       const participant = participants[index];
       if (!participant) continue;
-      // Derive operation direction from which account this participant owns.
-      // This supports both Alice→Bob (bank-a debits) and Bob→Alice (bank-b debits).
-      const isDebitor = participant.accountId === input.fromAccountId;
-      const operation = isDebitor
-        ? { kind: "debit" as const, accountId: input.fromAccountId, amountCents: input.amountCents }
-        : { kind: "credit" as const, accountId: input.toAccountId, amountCents: input.amountCents };
+
+      let operation: ParticipantOperation;
+      if (ratesService && participant.name === ratesService.name) {
+        operation = {
+          kind: "exchange",
+          fromCurrency,
+          toCurrency,
+          fromAmountCents: input.amountCents,
+        };
+      } else if (participant.accountId === input.fromAccountId) {
+        operation = {
+          kind: "debit",
+          accountId: input.fromAccountId,
+          amountCents: input.amountCents,
+        };
+      } else {
+        operation = {
+          kind: "credit",
+          accountId: input.toAccountId,
+          amountCents: targetCreditAmountCents,
+        };
+      }
+
       try {
-        await prepareParticipant(
+        const prepareResult = await prepareParticipant(
           participant,
           transactionId,
           operation,
           input.forcePrepareFailureAt === participant.name,
           this.config.participantTimeoutMs,
         );
+
+        if (ratesService && participant.name === ratesService.name && prepareResult) {
+          if (typeof prepareResult.toAmountCents === "number") {
+            targetCreditAmountCents = prepareResult.toAmountCents;
+          }
+          participant.metadata = {
+            rate: prepareResult.rate,
+            toAmountCents: targetCreditAmountCents,
+          };
+        }
+
         participants[index] = { ...participant, phase: "prepared" };
         await this.storeParticipants(transactionId, participants);
       } catch (error) {

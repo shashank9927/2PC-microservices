@@ -1,19 +1,28 @@
 import type { CoordinatorConfig } from "./config";
 
-export type ParticipantName = "bank-a" | "bank-b";
+export type ParticipantName = string;
 export type ParticipantProgress = {
   name: ParticipantName;
   url: string;
-  accountId: string;
+  accountId?: string;
   phase: "pending" | "prepared" | "prepare_failed" | "skipped" | "committed" | "rolled_back" | "resolution_failed";
   lastError?: string;
+  metadata?: Record<string, unknown>;
 };
 
-export type ParticipantOperation = {
-  kind: "debit" | "credit";
-  accountId: string;
-  amountCents: number;
-};
+export type ParticipantOperation =
+  | {
+      kind: "debit" | "credit";
+      accountId: string;
+      amountCents: number;
+    }
+  | {
+      kind: "exchange";
+      fromCurrency: string;
+      toCurrency: string;
+      fromAmountCents?: number;
+      amountCents?: number;
+    };
 
 export function configuredParticipants(config: CoordinatorConfig): ParticipantProgress[] {
   return [
@@ -27,7 +36,7 @@ async function post(
   path: string,
   body: Record<string, unknown>,
   timeoutMs: number,
-): Promise<void> {
+): Promise<Record<string, unknown> | undefined> {
   let response: Response;
   try {
     response = await fetch(`${participant.url}${path}`, {
@@ -44,6 +53,11 @@ async function post(
     const text = await response.text();
     throw new Error(`${participant.name} ${path} returned ${response.status}: ${text.slice(0, 500)}`);
   }
+  try {
+    return (await response.json()) as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function prepareParticipant(
@@ -52,8 +66,8 @@ export async function prepareParticipant(
   operation: ParticipantOperation,
   failBeforePrepare: boolean,
   timeoutMs: number,
-): Promise<void> {
-  await post(participant, "/prepare", { transactionId, operation, failBeforePrepare }, timeoutMs);
+): Promise<Record<string, unknown> | undefined> {
+  return post(participant, "/prepare", { transactionId, operation, failBeforePrepare }, timeoutMs);
 }
 
 export async function resolveParticipant(

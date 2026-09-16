@@ -4,6 +4,7 @@ export interface ParticipantConfig {
   port: number;
   initialAccountId: string;
   initialBalanceCents: number;
+  currency?: string;
 }
 
 function required(name: string): string {
@@ -27,5 +28,6 @@ export function loadConfig(): ParticipantConfig {
     port: positiveInteger("PORT", 3001),
     initialAccountId: required("PARTICIPANT_ACCOUNT_ID"),
     initialBalanceCents: positiveInteger("PARTICIPANT_INITIAL_BALANCE_CENTS", 1),
+    currency: process.env.CURRENCY ?? (process.env.PARTICIPANT_NAME === "bank-b" ? "EUR" : "USD"),
   };
 }

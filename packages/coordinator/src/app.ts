@@ -12,8 +12,16 @@ const transferSchema = z.object({
   fromAccountId: z.string().min(1).max(100).default("alice"),
   toAccountId: z.string().min(1).max(100).default("bob"),
   amountCents: z.number().int().positive(),
-  forcePrepareFailureAt: z.enum(["bank-a", "bank-b"]).optional(),
+  forcePrepareFailureAt: z.string().optional(),
   simulateCrashAfterDecision: z.boolean().optional().default(false),
+});
+
+const registerParticipantSchema = z.object({
+  name: z.string().min(1).max(100),
+  url: z.string().url(),
+  type: z.enum(["bank", "exchange-rate", "custom"]).default("bank"),
+  currency: z.string().min(1).max(10).optional(),
+  accountIds: z.array(z.string()).optional(),
 });
 
 function errorMessage(error: unknown): string {
@@ -26,6 +34,27 @@ export function createCoordinatorApp(prisma: PrismaClient, config: CoordinatorCo
   app.use(express.json());
 
   app.get("/health", (_request, response) => response.json({ ok: true }));
+
+  app.post("/participants/register", (request, response) => {
+    const parsed = registerParticipantSchema.safeParse(request.body);
+    if (!parsed.success) return response.status(400).json({ error: parsed.error.issues });
+    try {
+      coordinator.registry.register(parsed.data);
+      return response.status(201).json({ ok: true, participant: coordinator.registry.get(parsed.data.name) });
+    } catch (error) {
+      return response.status(400).json({ error: errorMessage(error) });
+    }
+  });
+
+  app.get("/participants", (_request, response) => {
+    response.json({ participants: coordinator.registry.list() });
+  });
+
+  app.delete("/participants/:name", (request, response) => {
+    const removed = coordinator.registry.unregister(request.params.name);
+    if (!removed) return response.status(404).json({ error: "Participant not found" });
+    return response.json({ ok: true });
+  });
 
   app.post("/transfers", async (request, response) => {
     const parsed = transferSchema.safeParse(request.body);
