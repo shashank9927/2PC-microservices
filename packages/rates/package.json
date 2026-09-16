@@ -1,0 +1,10 @@
+{
+  "name": "@demo/rates",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js"
+  }
+}
