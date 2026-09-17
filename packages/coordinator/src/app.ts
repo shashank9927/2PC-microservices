@@ -7,13 +7,32 @@ import {
   IdempotencyMismatchError,
   IdempotencyConflictError,
 } from "./transactionCoordinator";
+import { globalChaosMonkey } from "./chaosMonkey";
 
-const transferSchema = z.object({
-  fromAccountId: z.string().min(1).max(100).default("alice"),
-  toAccountId: z.string().min(1).max(100).default("bob"),
-  amountCents: z.number().int().positive(),
-  forcePrepareFailureAt: z.string().optional(),
-  simulateCrashAfterDecision: z.boolean().optional().default(false),
+const transferSchema = z
+  .object({
+    fromAccountId: z.string().min(1).max(100).default("alice"),
+    toAccountId: z.string().min(1).max(100).default("bob"),
+    amountCents: z.number().int(),
+    readOnlyParticipants: z.array(z.string()).optional(),
+    forcePrepareFailureAt: z.string().optional(),
+    simulateCrashAfterDecision: z.boolean().optional().default(false),
+  })
+  .refine(
+    (data) =>
+      data.readOnlyParticipants && data.readOnlyParticipants.length > 0
+        ? data.amountCents >= 0
+        : data.amountCents > 0,
+    { message: "amountCents must be positive unless readOnlyParticipants is specified", path: ["amountCents"] },
+  );
+
+const chaosRuleSchema = z.object({
+  id: z.string().optional(),
+  target: z.string().min(1),
+  path: z.string().optional(),
+  action: z.enum(["drop", "delay", "partition", "error"]),
+  delayMs: z.number().int().nonnegative().optional(),
+  times: z.number().int().positive().optional(),
 });
 
 const registerParticipantSchema = z.object({
@@ -122,6 +141,32 @@ export function createCoordinatorApp(prisma: PrismaClient, config: CoordinatorCo
     } catch (error) {
       return response.status(500).json({ error: errorMessage(error) });
     }
+  });
+
+  app.post("/chaos/rules", (request, response) => {
+    const parsed = chaosRuleSchema.safeParse(request.body);
+    if (!parsed.success) return response.status(400).json({ error: parsed.error.issues });
+    try {
+      const rule = globalChaosMonkey.addRule(parsed.data);
+      return response.status(201).json({ ok: true, rule });
+    } catch (error) {
+      return response.status(400).json({ error: errorMessage(error) });
+    }
+  });
+
+  app.get("/chaos/rules", (_request, response) => {
+    return response.json({ rules: globalChaosMonkey.getRules() });
+  });
+
+  app.delete("/chaos/rules/:id", (request, response) => {
+    const removed = globalChaosMonkey.removeRule(request.params.id);
+    if (!removed) return response.status(404).json({ error: "Rule not found" });
+    return response.json({ ok: true });
+  });
+
+  app.post("/chaos/reset", (_request, response) => {
+    globalChaosMonkey.clear();
+    return response.json({ ok: true });
   });
 
   app.use((error: unknown, _request: express.Request, response: express.Response, _next: express.NextFunction) => {

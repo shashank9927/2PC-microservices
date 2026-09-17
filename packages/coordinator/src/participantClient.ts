@@ -1,20 +1,21 @@
 import type { CoordinatorConfig } from "./config";
+import { globalChaosMonkey, type ChaosMonkey } from "./chaosMonkey";
 
 export type ParticipantName = string;
 export type ParticipantProgress = {
   name: ParticipantName;
   url: string;
   accountId?: string;
-  phase: "pending" | "prepared" | "prepare_failed" | "skipped" | "committed" | "rolled_back" | "resolution_failed";
+  phase: "pending" | "prepared" | "read_only" | "prepare_failed" | "skipped" | "committed" | "rolled_back" | "resolution_failed";
   lastError?: string;
   metadata?: Record<string, unknown>;
 };
 
 export type ParticipantOperation =
   | {
-      kind: "debit" | "credit";
+      kind: "debit" | "credit" | "read_only";
       accountId: string;
-      amountCents: number;
+      amountCents?: number;
     }
   | {
       kind: "exchange";
@@ -36,14 +37,17 @@ async function post(
   path: string,
   body: Record<string, unknown>,
   timeoutMs: number,
+  chaosMonkey: ChaosMonkey = globalChaosMonkey,
 ): Promise<Record<string, unknown> | undefined> {
+  const signal = AbortSignal.timeout(timeoutMs);
   let response: Response;
   try {
+    await chaosMonkey.intercept(participant.name, path, signal);
     response = await fetch(`${participant.url}${path}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
+      signal,
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -66,8 +70,9 @@ export async function prepareParticipant(
   operation: ParticipantOperation,
   failBeforePrepare: boolean,
   timeoutMs: number,
+  chaosMonkey?: ChaosMonkey,
 ): Promise<Record<string, unknown> | undefined> {
-  return post(participant, "/prepare", { transactionId, operation, failBeforePrepare }, timeoutMs);
+  return post(participant, "/prepare", { transactionId, operation, failBeforePrepare }, timeoutMs, chaosMonkey);
 }
 
 export async function resolveParticipant(
@@ -75,6 +80,7 @@ export async function resolveParticipant(
   transactionId: string,
   decision: "COMMIT" | "ABORT",
   timeoutMs: number,
+  chaosMonkey?: ChaosMonkey,
 ): Promise<void> {
-  await post(participant, decision === "COMMIT" ? "/commit" : "/rollback", { transactionId }, timeoutMs);
+  await post(participant, decision === "COMMIT" ? "/commit" : "/rollback", { transactionId }, timeoutMs, chaosMonkey);
 }
