@@ -757,6 +757,229 @@ async function runTests() {
       details: `Bob (EUR) -${bal23BeforeB - bal23AfterB}, Alice (USD) +${bal23AfterA - bal23BeforeA}, Decision: ${transfer23Res.body.decision}`,
     });
 
+    // TEST 24: Read-Only / One-Phase Commit (1PC) Optimization
+    console.log("\n--- TEST 24: Read-Only / One-Phase Commit (1PC) Optimization ---");
+    const bal24BeforeA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal24BeforeB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    // Send transfer where Bank B is marked read-only
+    const transfer24Res = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fromAccountId: "alice",
+        toAccountId: "bob",
+        amountCents: 1000,
+        readOnlyParticipants: ["bank-b"],
+      }),
+    });
+
+    const bal24AfterA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal24AfterB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    // Check transaction participant list in coordinator log
+    const tx24 = (await api("http://127.0.0.1:3010/transactions")).body.find((t: any) => t.id === transfer24Res.body.transactionId);
+    const bankAParticipant24 = tx24?.participants?.find((p: any) => p.name === "bank-a");
+    const bankBParticipant24 = tx24?.participants?.find((p: any) => p.name === "bank-b");
+
+    // Bank B prepared transactions check (must be 0 because read-only participants do not prepare transactions in pg)
+    const bankBPrepared24 = (await api("http://127.0.0.1:3012/prepared")).body.prepared;
+    const noBankBPreparedTx = !bankBPrepared24?.some((p: any) => p.gid === transfer24Res.body.transactionId);
+
+    // Also test zero-delta transfer (both participants are read-only)
+    const transfer24ZeroRes = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fromAccountId: "alice",
+        toAccountId: "bob",
+        amountCents: 0,
+        readOnlyParticipants: ["bank-a", "bank-b"],
+      }),
+    });
+    const tx24Zero = (await api("http://127.0.0.1:3010/transactions")).body.find((t: any) => t.id === transfer24ZeroRes.body.transactionId);
+    const bothReadOnly = tx24Zero?.participants
+      ?.filter((p: any) => p.name === "bank-a" || p.name === "bank-b")
+      ?.every((p: any) => p.phase === "read_only");
+
+    const t24Passed =
+      transfer24Res.status === 201 &&
+      transfer24Res.body.decision === "COMMIT" &&
+      transfer24Res.body.complete === true &&
+      bal24AfterA === bal24BeforeA - 1000 &&
+      bal24AfterB === bal24BeforeB && // Bank B balance unchanged (read-only)
+      bankAParticipant24?.phase === "committed" &&
+      bankBParticipant24?.phase === "read_only" && // Bank B recorded as read_only and dismissed from Phase 2
+      noBankBPreparedTx &&
+      transfer24ZeroRes.status === 201 &&
+      bothReadOnly;
+
+    results.push({
+      name: "Read-Only / 1PC Optimization (XA VOTE_READ_ONLY & Phase-2 Dismissal)",
+      passed: t24Passed,
+      details: `Bank A phase: ${bankAParticipant24?.phase}, Bank B phase: ${bankBParticipant24?.phase}, Bank B bal delta: ${bal24AfterB - bal24BeforeB}, Zero-delta both read_only: ${bothReadOnly}`,
+    });
+
+    // TEST 25: Chaos Monkey - Phase 1 Packet Drop Triggers Abort & Rollback
+    console.log("\n--- TEST 25: Chaos Monkey Phase 1 Packet Drop ---");
+    // Clear existing rules
+    await api("http://127.0.0.1:3010/chaos/reset", { method: "POST" });
+    // Add rule: drop packets on Bank B /prepare
+    const addRule25 = await api("http://127.0.0.1:3010/chaos/rules", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        target: "bank-b",
+        path: "/prepare",
+        action: "drop",
+        times: 1,
+      }),
+    });
+
+    const bal25BeforeA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal25BeforeB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    const transfer25Res = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fromAccountId: "alice", toAccountId: "bob", amountCents: 1000 }),
+    });
+
+    const bal25AfterA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal25AfterB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    const chaosRules25 = (await api("http://127.0.0.1:3010/chaos/rules")).body.rules;
+    const rule25 = chaosRules25.find((r: any) => r.id === addRule25.body.rule.id);
+
+    const t25Passed =
+      transfer25Res.status === 422 &&
+      transfer25Res.body.decision === "ABORT" &&
+      bal25AfterA === bal25BeforeA && // Alice rolled back
+      bal25AfterB === bal25BeforeB && // Bob unchanged
+      rule25?.hits === 1;
+
+    results.push({
+      name: "Chaos Monkey: Phase 1 Packet Drop (Automatic 2PC Abort & Rollback)",
+      passed: t25Passed,
+      details: `Status: ${transfer25Res.status}, Decision: ${transfer25Res.body.decision}, Balances intact: ${bal25AfterA === bal25BeforeA}, Rule hits: ${rule25?.hits}`,
+    });
+
+    // TEST 26: Chaos Monkey - Phase 2 Packet Drop & Recovery Worker Healing
+    console.log("\n--- TEST 26: Chaos Monkey Phase 2 Packet Drop & Recovery Healing ---");
+    await api("http://127.0.0.1:3010/chaos/reset", { method: "POST" });
+    // Add rule: drop 1 packet on Bank B /commit
+    const addRule26 = await api("http://127.0.0.1:3010/chaos/rules", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        target: "bank-b",
+        path: "/commit",
+        action: "drop",
+        times: 1,
+      }),
+    });
+
+    const bal26BeforeA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal26BeforeB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    // Send transfer: Phase 1 succeeds for Bank A and Bank B. Durable decision COMMIT is recorded in DB.
+    // In Phase 2: Bank A commits, but Bank B /commit drops due to chaos rule!
+    const transfer26Res = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fromAccountId: "alice", toAccountId: "bob", amountCents: 1000 }),
+    });
+
+    const bal26MidA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal26MidB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    // Coordinator returns 202 Accepted (decision COMMIT made, but Phase 2 incomplete)
+    const tx26DbMid = await coordPrisma.distributedTransaction.findUnique({
+      where: { id: transfer26Res.body.transactionId },
+    });
+
+    // Bank B still has the prepared transaction locked
+    const bankBPrepared26 = (await api("http://127.0.0.1:3012/prepared")).body.prepared;
+    const bankBHasLock26 = bankBPrepared26?.some((p: any) => p.gid === transfer26Res.body.transactionId);
+
+    // Now execute Recovery Worker (simulating background recovery sweep or post-partition heal)
+    const rec26Res = await api("http://127.0.0.1:3010/recovery/run", { method: "POST" });
+
+    const bal26AfterA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal26AfterB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    const tx26DbAfter = await coordPrisma.distributedTransaction.findUnique({
+      where: { id: transfer26Res.body.transactionId },
+    });
+
+    // Bank B prepared transaction should now be resolved (committed)
+    const bankBPrepared26After = (await api("http://127.0.0.1:3012/prepared")).body.prepared;
+    const bankBLockCleared26 = !bankBPrepared26After?.some((p: any) => p.gid === transfer26Res.body.transactionId);
+
+    const t26Passed =
+      transfer26Res.status === 202 &&
+      transfer26Res.body.complete === false &&
+      tx26DbMid?.status === "DECIDED" &&
+      bankBHasLock26 &&
+      bal26MidA === bal26BeforeA - 1000 &&
+      bal26MidB === bal26BeforeB && // Bob not yet credited
+      tx26DbAfter?.status === "COMPLETED" &&
+      bal26AfterB === bal26BeforeB + 850 && // USD -> EUR exchange rate 0.85
+      bankBLockCleared26;
+
+    results.push({
+      name: "Chaos Monkey: Phase 2 Network Degradation & Recovery Worker Healing",
+      passed: t26Passed,
+      details: `Mid Status: ${tx26DbMid?.status} (incomplete: ${!transfer26Res.body.complete}), Post-Recovery Status: ${tx26DbAfter?.status}, Bob +${bal26AfterB - bal26BeforeB} EUR cents, Lock cleared: ${bankBLockCleared26}`,
+    });
+
+    // TEST 27: Chaos Monkey - Injected Latency & Network Timeout
+    console.log("\n--- TEST 27: Chaos Monkey Injected Latency & Timeout Abort ---");
+    await api("http://127.0.0.1:3010/chaos/reset", { method: "POST" });
+    // Add rule: inject 3500ms delay on Bank B /prepare (coordinator timeout is 3000ms)
+    const addRule27 = await api("http://127.0.0.1:3010/chaos/rules", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        target: "bank-b",
+        path: "/prepare",
+        action: "delay",
+        delayMs: 3500,
+        times: 1,
+      }),
+    });
+
+    const bal27BeforeA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal27BeforeB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    const transfer27Res = await api("http://127.0.0.1:3010/transfers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fromAccountId: "alice", toAccountId: "bob", amountCents: 500 }),
+    });
+
+    const bal27AfterA = (await api("http://127.0.0.1:3011/accounts")).body.accounts?.[0]?.balanceCents;
+    const bal27AfterB = (await api("http://127.0.0.1:3012/accounts")).body.accounts?.[0]?.balanceCents;
+
+    const chaosRules27 = (await api("http://127.0.0.1:3010/chaos/rules")).body.rules;
+    const rule27 = chaosRules27.find((r: any) => r.id === addRule27.body.rule.id);
+
+    // Clean up all chaos rules
+    await api("http://127.0.0.1:3010/chaos/reset", { method: "POST" });
+
+    const t27Passed =
+      transfer27Res.status === 422 &&
+      transfer27Res.body.decision === "ABORT" &&
+      bal27AfterA === bal27BeforeA &&
+      bal27AfterB === bal27BeforeB &&
+      rule27?.hits === 1;
+
+    results.push({
+      name: "Chaos Monkey: Injected Latency & Network Timeout Handling",
+      passed: t27Passed,
+      details: `Decision: ${transfer27Res.body.decision}, Balances intact: ${bal27AfterA === bal27BeforeA}, Rule hits: ${rule27?.hits}`,
+    });
+
   } finally {
     // Cleanup servers
     serverCoord.close();

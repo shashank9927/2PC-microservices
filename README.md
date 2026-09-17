@@ -145,6 +145,23 @@ This endpoint is intentionally unauthenticated because it is a local protocol de
 | Participant | `GET /accounts`, `GET /prepared` | Inspect local committed state and prepared transactions. |
 | Rate Service | `GET /rates`, `POST /rates` | Inspect or update exchange rates (e.g. USD:EUR, EUR:USD). |
 | Rate Service | `POST /prepare`, `/commit`, `/rollback` | 2PC participant endpoints to lock and settle exchange rate quotes. |
+| Coordinator | `POST /chaos/rules`, `GET /chaos/rules` | Add or list Chaos Monkey rules (dropped packets, injected latency, network partitions). |
+| Coordinator | `DELETE /chaos/rules/:id`, `POST /chaos/reset` | Delete a specific chaos rule or clear all active chaos rules. |
+
+## Advanced Enterprise Optimizations & Resilience
+
+### 1. Read-Only / One-Phase Commit (1PC) Optimization
+In classic enterprise transaction managers (Tuxedo, XA, Narayana), participants that only perform read operations, balance inquiries, or have zero balance delta vote `VOTE_READ_ONLY` in Phase 1.
+- **Phase-2 Dismissal:** The coordinator immediately marks that participant as `read_only` and dismisses them from Phase 2.
+- **Zero Lock Contention:** The participant executes read validation without `FOR UPDATE` and completely skips `PREPARE TRANSACTION`, leaving no prepared locks in PostgreSQL.
+- **50% Network Round-Trip Reduction:** Cuts Phase-2 message overhead entirely for read-only participants.
+
+### 2. Chaos Monkey / Network Partition & Latency Injector
+A built-in fault-injection interceptor allows testing distributed networking degradation:
+- **Packet Drops (`action: "drop"`):** Simulates lost messages between coordinator and participants in Phase 1 or Phase 2.
+- **Injected Latency (`action: "delay"`):** Delays outgoing requests by configurable milliseconds (e.g. 3500ms) to test socket timeouts and client aborts.
+- **Network Partitions (`action: "partition"`):** Simulates split-brain and unreachable services.
+- **Cluster Self-Healing:** Proves that transient Phase-2 drops (e.g. `times: 1`) leave transactions in `DECIDED`, which the automated recovery worker (`/recovery/run`) subsequently replays and heals to `COMPLETED`.
 
 ## Failure semantics and operational limits
 
@@ -152,9 +169,11 @@ This endpoint is intentionally unauthenticated because it is a local protocol de
 2. **After a decision:** Recovery is deterministic. The coordinator only replays its persisted `COMMIT` or `ABORT`, at startup and every 10 seconds until all participant calls acknowledge.
 3. **Idempotency keys:** Clients can pass an `Idempotency-Key` HTTP header to `POST /transfers`. Duplicate requests return the original transaction response and prevent double debits/credits. Mismatched request parameters for an existing key return `422 Unprocessable Entity`.
 4. **Multi-currency 3-participant 2PC:** Cross-currency transfers (USD -> EUR) coordinate three 2PC participants in atomic lock-step: Bank A debits USD, Rates Service locks the exchange rate quote, and Bank B credits the converted EUR. If any participant fails, all prepared participants are rolled back.
-5. **Participant response timeout:** A timeout in phase 1 causes a durable `ABORT`. A timeout in phase 2 leaves the decision log in `DECIDED`, and recovery retries it. Network uncertainty means a participant can have prepared even when its response was lost, which is why abort is sent to every participant.
-6. **Idempotent resolution:** A participant treats a missing GID as `not_found`, so repeated phase-2 delivery is safe for this demo. Production systems normally add reconciliation/audit records and alerting for a missing expected GID, because absence alone cannot prove whether a human or prior resolver committed or rolled it back.
-7. **2PC cost:** Prepared transactions hold locks and consume PostgreSQL resources. They should be monitored (`pg_prepared_xacts`), time-bounded operationally, and kept very short. A Saga trades global atomicity for local commits plus compensating actions, usually giving higher availability for long-running workflows.
+5. **Read-only participants:** Participants voting `VOTE_READ_ONLY` hold no `pg_prepared_xacts` and receive zero Phase-2 calls, releasing participant resources immediately.
+6. **Network degradation & Chaos Monkey:** Simulated latency exceeding `participantTimeoutMs` or dropped Phase-1 packets trigger automatic rollback of prepared participants. Dropped Phase-2 packets are safely recovered by the crash recovery worker.
+7. **Participant response timeout:** A timeout in phase 1 causes a durable `ABORT`. A timeout in phase 2 leaves the decision log in `DECIDED`, and recovery retries it. Network uncertainty means a participant can have prepared even when its response was lost, which is why abort is sent to every participant.
+8. **Idempotent resolution:** A participant treats a missing GID as `not_found`, so repeated phase-2 delivery is safe for this demo. Production systems normally add reconciliation/audit records and alerting for a missing expected GID, because absence alone cannot prove whether a human or prior resolver committed or rolled it back.
+9. **2PC cost:** Prepared transactions hold locks and consume PostgreSQL resources. They should be monitored (`pg_prepared_xacts`), time-bounded operationally, and kept very short. A Saga trades global atomicity for local commits plus compensating actions, usually giving higher availability for long-running workflows.
 
 ## Resetting the demo
 
