@@ -10,8 +10,8 @@ const prepareSchema = z.object({
     kind: z.literal("exchange").default("exchange"),
     fromCurrency: z.string().min(1).max(10).default("USD"),
     toCurrency: z.string().min(1).max(10).default("EUR"),
-    fromAmountCents: z.number().int().positive().optional(),
-    amountCents: z.number().int().positive().optional(),
+    fromAmountCents: z.number().int().nonnegative().optional(),
+    amountCents: z.number().int().nonnegative().optional(),
   }),
   failBeforePrepare: z.boolean().optional().default(false),
 });
@@ -72,7 +72,7 @@ export function createRatesApp(options: RatesAppOptions = {}) {
 
     try {
       const amount = parsed.data.operation.fromAmountCents ?? parsed.data.operation.amountCents;
-      if (!amount) throw new Error("amountCents or fromAmountCents must be provided");
+      if (typeof amount !== "number") throw new Error("amountCents or fromAmountCents must be provided");
 
       const result = ratesService.prepareQuote(
         parsed.data.transactionId,

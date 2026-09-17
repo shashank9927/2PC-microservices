@@ -1,9 +1,9 @@
 import { Pool, PoolClient } from "pg";
 
 export type Operation = {
-  kind: "debit" | "credit";
+  kind: "debit" | "credit" | "read_only";
   accountId: string;
-  amountCents: number;
+  amountCents?: number;
 };
 
 export type ResolutionResult = "committed" | "rolled_back" | "not_found";
@@ -29,15 +29,31 @@ export async function prepareOperation(
   pool: Pool,
   transactionId: string,
   operation: Operation,
-): Promise<"prepared" | "already_prepared"> {
+): Promise<"prepared" | "already_prepared" | "read_only"> {
   const client = await pool.connect();
   let prepared = false;
+  let inTransaction = false;
   try {
+    // Read-Only / 1PC Optimization:
+    // In classic XA / 2PC, if a participant only performed read operations or had zero
+    // balance delta, it votes VOTE_READ_ONLY in Phase 1.
+    // We check that the account exists, but skip row locking (FOR UPDATE), skip balance update,
+    // and skip PREPARE TRANSACTION so no locks or prepared transactions are held in PostgreSQL.
+    if (operation.kind === "read_only" || operation.amountCents === 0) {
+      const account = await client.query<{ balanceCents: number }>(
+        'SELECT "balanceCents" FROM "Account" WHERE id = $1',
+        [operation.accountId],
+      );
+      if (account.rowCount !== 1) throw new Error(`Account ${operation.accountId} does not exist`);
+      return "read_only";
+    }
+
     // A request retry after a coordinator timeout must not create a second
     // transaction. The already-prepared GID is the durable idempotency key.
     if (await hasPreparedTransaction(client, transactionId)) return "already_prepared";
 
     await client.query("BEGIN");
+    inTransaction = true;
     const account = await client.query<{ balanceCents: number }>(
       'SELECT "balanceCents" FROM "Account" WHERE id = $1 FOR UPDATE',
       [operation.accountId],
@@ -45,11 +61,12 @@ export async function prepareOperation(
     if (account.rowCount !== 1) throw new Error(`Account ${operation.accountId} does not exist`);
 
     const currentBalance = account.rows[0].balanceCents;
-    if (operation.kind === "debit" && currentBalance < operation.amountCents) {
+    const amount = operation.amountCents ?? 0;
+    if (operation.kind === "debit" && currentBalance < amount) {
       throw new Error("Insufficient funds");
     }
 
-    const delta = operation.kind === "debit" ? -operation.amountCents : operation.amountCents;
+    const delta = operation.kind === "debit" ? -amount : amount;
     await client.query(
       'UPDATE "Account" SET "balanceCents" = "balanceCents" + $1, "updatedAt" = NOW() WHERE id = $2',
       [delta, operation.accountId],
@@ -61,7 +78,7 @@ export async function prepareOperation(
     prepared = true;
     return "prepared";
   } finally {
-    if (!prepared) {
+    if (inTransaction && !prepared) {
       await client.query("ROLLBACK").catch(() => undefined);
     }
     client.release();

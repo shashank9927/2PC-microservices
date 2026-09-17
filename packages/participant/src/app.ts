@@ -9,9 +9,9 @@ const transactionIdSchema = z.string().regex(/^[a-zA-Z0-9_-]{1,180}$/);
 const prepareSchema = z.object({
   transactionId: transactionIdSchema,
   operation: z.object({
-    kind: z.enum(["debit", "credit"]),
+    kind: z.enum(["debit", "credit", "read_only"]),
     accountId: z.string().min(1).max(100),
-    amountCents: z.number().int().positive(),
+    amountCents: z.number().int().nonnegative().optional().default(0),
   }),
   // Used only by the demo to make the coordinator take the abort path.
   failBeforePrepare: z.boolean().optional().default(false),
@@ -63,7 +63,13 @@ export async function createParticipantApp(config: ParticipantConfig) {
 
     try {
       const state = await prepareOperation(pool, parsed.data.transactionId, parsed.data.operation);
-      return response.status(200).json({ participant: config.name, state, transactionId: parsed.data.transactionId });
+      const vote = state === "read_only" ? "VOTE_READ_ONLY" : "VOTE_COMMIT";
+      return response.status(200).json({
+        participant: config.name,
+        state,
+        vote,
+        transactionId: parsed.data.transactionId,
+      });
     } catch (error) {
       return response.status(409).json({ participant: config.name, error: errorMessage(error) });
     }
