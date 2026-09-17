@@ -30,6 +30,7 @@ export type TransferRequest = {
   toAccountId: string;
   amountCents: number;
   idempotencyKey?: string;
+  readOnlyParticipants?: string[];
   forcePrepareFailureAt?: ParticipantName;
   simulateCrashAfterDecision?: boolean;
 };
@@ -221,12 +222,20 @@ export class TransactionCoordinator {
       if (!participant) continue;
 
       let operation: ParticipantOperation;
+      const isExplicitReadOnly = input.readOnlyParticipants?.includes(participant.name) || input.amountCents === 0;
+
       if (ratesService && participant.name === ratesService.name) {
         operation = {
           kind: "exchange",
           fromCurrency,
           toCurrency,
           fromAmountCents: input.amountCents,
+        };
+      } else if (isExplicitReadOnly) {
+        operation = {
+          kind: "read_only",
+          accountId: participant.accountId ?? (participant.name === fromBank.name ? input.fromAccountId : input.toAccountId),
+          amountCents: 0,
         };
       } else if (participant.accountId === input.fromAccountId) {
         operation = {
@@ -251,6 +260,11 @@ export class TransactionCoordinator {
           this.config.participantTimeoutMs,
         );
 
+        const isReadOnlyVote =
+          prepareResult?.vote === "VOTE_READ_ONLY" ||
+          prepareResult?.state === "read_only" ||
+          operation.kind === "read_only";
+
         if (ratesService && participant.name === ratesService.name && prepareResult) {
           if (typeof prepareResult.toAmountCents === "number") {
             targetCreditAmountCents = prepareResult.toAmountCents;
@@ -261,7 +275,10 @@ export class TransactionCoordinator {
           };
         }
 
-        participants[index] = { ...participant, phase: "prepared" };
+        participants[index] = {
+          ...participant,
+          phase: isReadOnlyVote ? "read_only" : "prepared",
+        };
         await this.storeParticipants(transactionId, participants);
       } catch (error) {
         prepareError = errorMessage(error);
